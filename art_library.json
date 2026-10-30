@@ -1,0 +1,11 @@
+
+{
+  "channel": "didacticjam",
+  "weights": {
+    "fanart": 55,
+    "concept": 20,
+    "screenshot": 15,
+    "other": 10
+  },
+  "images": []
+}

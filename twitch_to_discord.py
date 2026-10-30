@@ -2,177 +2,345 @@
 import json
 import os
 import random
+import re
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 CHANNEL = "didacticjam"
 CHANNEL_URL = f"https://www.twitch.tv/{CHANNEL}"
-
-LIBRARY_FILE = Path("art_library.json")
 STATE_FILE = Path("twitch_state.json")
 
 CLIENT_ID = os.environ["TWITCH_CLIENT_ID"]
 CLIENT_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 
-CATEGORIES = ("fanart", "concept", "screenshot", "other")
-PERMITTED_REUSE = {
-    "permission-granted",
-    "licensed",
-    "self-created",
-}
+# Artwork selection weights.
+FANART_WEIGHT = 55
+SCREENSHOT_WEIGHT = 45
+
+# Automatic image matching is conservative.
+# Set to False only if you accept looser matches.
+STRICT_GAME_MATCHING = True
+
+# Never use wiki-hosted or wiki-sourced images.
+BLOCKED_DOMAINS = (
+    "fandom.com",
+    "wikia.com",
+    "wikipedia.org",
+    "wikimedia.org",
+)
+
+# Require licenses that permit redistribution.
+# This does NOT independently verify copyright claims.
+ALLOWED_LICENSES = {"by", "by-sa", "cc0"}
 
 
-def api_request(url, data=None, headers=None):
+def request_json(url, data=None, headers=None):
     req = urllib.request.Request(
-        url, data=data, headers=headers or {}
+        url,
+        data=data,
+        headers={
+            "User-Agent": "DidacticJamArtBot/1.0",
+            **(headers or {}),
+        },
     )
+
     with urllib.request.urlopen(req, timeout=30) as response:
         return json.load(response)
 
 
-def get_access_token():
+def get_token():
     body = urllib.parse.urlencode({
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "grant_type": "client_credentials",
-    }).encode("utf-8")
+    }).encode()
 
-    response = api_request(
+    return request_json(
         "https://id.twitch.tv/oauth2/token",
         data=body,
         headers={
             "Content-Type": "application/x-www-form-urlencoded"
         },
-    )
-    return response["access_token"]
+    )["access_token"]
 
 
-def get_live_stream(token):
-    query = urllib.parse.urlencode({
+def twitch_headers(token):
+    return {
+        "Client-Id": CLIENT_ID,
+        "Authorization": f"Bearer {token}",
+    }
+
+
+def get_stream(token):
+    params = urllib.parse.urlencode({
         "user_login": CHANNEL
     })
 
-    response = api_request(
-        f"https://api.twitch.tv/helix/streams?{query}",
-        headers={
-            "Client-Id": CLIENT_ID,
-            "Authorization": f"Bearer {token}",
-        },
-    )
-    streams = response.get("data", [])
-    return streams[0] if streams else None
-
-
-def load_library():
-    return json.loads(
-        LIBRARY_FILE.read_text(encoding="utf-8")
+    result = request_json(
+        f"https://api.twitch.tv/helix/streams?{params}",
+        headers=twitch_headers(token),
     )
 
-
-def is_eligible(image, game_id):
-    required = (
-        "id",
-        "image_url",
-        "source_url",
-        "creator",
-        "category",
-    )
-
-    if not all(image.get(key) for key in required):
-        return False
-
-    if str(image.get("twitch_game_id")) != str(game_id):
-        return False
-
-    if image.get("approved") is not True:
-        return False
-
-    if image.get("sfw") is not True:
-        return False
-
-    if image.get("reuse_permission") not in PERMITTED_REUSE:
-        return False
-
-    if image.get("category") not in CATEGORIES:
-        return False
-
-    if not image["image_url"].startswith("https://"):
-        return False
-
-    if not image["source_url"].startswith("https://"):
-        return False
-
-    return True
+    data = result.get("data", [])
+    return data[0] if data else None
 
 
-def choose_image(game_id, library, state):
-    eligible = [
-        image for image in library.get("images", [])
-        if is_eligible(image, game_id)
-    ]
-
-    if not eligible:
-        print(f"No approved images for game {game_id}")
+def get_igdb_id(game_id, token):
+    if not game_id:
         return None
 
-    # Avoid recently used images for this game.
-    recent = state.setdefault("image_history", {}).get(
-        str(game_id), []
+    params = urllib.parse.urlencode({"id": game_id})
+    result = request_json(
+        f"https://api.twitch.tv/helix/games?{params}",
+        headers=twitch_headers(token),
     )
 
-    unused = [
-        image for image in eligible
-        if image["id"] not in recent
+    games = result.get("data", [])
+    return games[0].get("igdb_id") if games else None
+
+
+def forbidden_url(url):
+    try:
+        hostname = (
+            urllib.parse.urlsplit(url).hostname or ""
+        ).lower()
+    except ValueError:
+        return True
+
+    return any(
+        hostname == domain or hostname.endswith("." + domain)
+        for domain in BLOCKED_DOMAINS
+    )
+
+
+def safe_url(url):
+    return (
+        isinstance(url, str)
+        and url.startswith("https://")
+        and not forbidden_url(url)
+    )
+
+
+def normalize(text):
+    return re.sub(
+        r"[^a-z0-9]+", " ",
+        str(text).lower(),
+    ).strip()
+
+
+def matching_game(game_name, item):
+    """
+    Conservative text matching to reduce wrong-game results.
+    This is not visual verification.
+    """
+    title = normalize(item.get("title", ""))
+    game = normalize(game_name)
+
+    if not game or not title:
+        return False
+
+    if STRICT_GAME_MATCHING:
+        return game in title
+
+    return all(
+        word in title.split()
+        for word in game.split()
+        if len(word) > 2
+    )
+
+
+def get_fanart(game_name):
+    """
+    Search openly licensed images.
+    Only use entries with known source, creator,
+    and license metadata.
+    """
+
+    query = urllib.parse.urlencode({
+        "q": f'"{game_name}" fan art',
+        "mature": "false",
+        "license": "by,by-sa,cc0",
+        "page_size": 50,
+        "filter_dead": "true",
+    })
+
+    url = (
+        "https://api.openverse.org/v1/images/"
+        f"?{query}"
+    )
+
+    try:
+        result = request_json(url)
+        images = []
+
+        for item in result.get("results", []):
+            image_url = item.get("url", "")
+            source_url = item.get(
+                "foreign_landing_url", ""
+            )
+            creator = item.get("creator")
+            license_name = (
+                item.get("license") or ""
+            ).lower()
+
+            if item.get("mature") is not False:
+                continue
+
+            if license_name not in ALLOWED_LICENSES:
+                continue
+
+            if not creator or not source_url:
+                continue
+
+            if not safe_url(image_url):
+                continue
+
+            if not safe_url(source_url):
+                continue
+
+            if not matching_game(game_name, item):
+                continue
+
+            width = item.get("width") or 0
+            height = item.get("height") or 0
+
+            # Prefer horizontal images.
+            if width < 600 or height < 300:
+                continue
+
+            if width < height:
+                continue
+
+            images.append({
+                "id": "openverse-" + item["id"],
+                "type": "fanart",
+                "url": image_url,
+                "source_url": source_url,
+                "creator": creator,
+                "license": license_name.upper(),
+                "license_url": item.get("license_url"),
+            })
+
+        print(f"Found {len(images)} fan-art candidates")
+        return images
+
+    except Exception as error:
+        print(f"Fan-art lookup failed: {error}")
+        return []
+
+
+def get_screenshots(igdb_id, token):
+    if not igdb_id:
+        return []
+
+    body = (
+        "fields image_id,width,height; "
+        f"where game = {int(igdb_id)}; "
+        "limit 100;"
+    ).encode()
+
+    try:
+        screenshots = request_json(
+            "https://api.igdb.com/v4/screenshots",
+            data=body,
+            headers={
+                **twitch_headers(token),
+                "Content-Type": "text/plain",
+            },
+        )
+
+        results = []
+
+        for shot in screenshots:
+            image_id = shot.get("image_id")
+            width = shot.get("width") or 0
+            height = shot.get("height") or 0
+
+            if not image_id or width <= height:
+                continue
+
+            url = (
+                "https://images.igdb.com/igdb/"
+                f"image/upload/t_1080p/{image_id}.jpg"
+            )
+
+            results.append({
+                "id": "igdb-" + str(image_id),
+                "type": "screenshot",
+                "url": url,
+                "source_url": (
+                    f"https://www.igdb.com/games/"
+                    f"{igdb_id}"
+                ),
+                "creator": "IGDB game screenshots",
+                "license": None,
+                "license_url": None,
+            })
+
+        print(f"Found {len(results)} gameplay screenshots")
+        return results
+
+    except Exception as error:
+        print(f"Screenshot lookup failed: {error}")
+        return []
+
+
+def choose_image(game_id, fanart, screenshots, state):
+    history = state.setdefault(
+        "image_history", {}
+    ).get(str(game_id), [])
+
+    all_images = fanart + screenshots
+
+    if not all_images:
+        return None
+
+    # Prioritize never-used images.
+    available = [
+        img for img in all_images
+        if img["id"] not in history
     ]
 
-    # Reset the pool once all images have been used.
-    if not unused:
-        unused = [
-            image for image in eligible
-            if image["id"] != recent[-1]
-        ] if recent else eligible
+    if not available:
+        # Start a new rotation, avoiding last image.
+        last_id = history[-1] if history else None
+        available = [
+            img for img in all_images
+            if img["id"] != last_id
+        ] or all_images
 
-        if not unused:
-            unused = eligible
+    fan_pool = [
+        img for img in available
+        if img["type"] == "fanart"
+    ]
+    screenshot_pool = [
+        img for img in available
+        if img["type"] == "screenshot"
+    ]
 
-    # Group available images by type.
-    groups = {}
-    for category in CATEGORIES:
-        matches = [
-            image for image in unused
-            if image["category"] == category
-        ]
-        if matches:
-            groups[category] = matches
+    if fan_pool and screenshot_pool:
+        category = random.choices(
+            ["fanart", "screenshot"],
+            weights=[
+                FANART_WEIGHT,
+                SCREENSHOT_WEIGHT,
+            ],
+            k=1,
+        )[0]
+        pool = (
+            fan_pool
+            if category == "fanart"
+            else screenshot_pool
+        )
+    else:
+        pool = fan_pool or screenshot_pool
 
-    weights = library.get("weights", {})
-    categories = list(groups)
-
-    selected_category = random.choices(
-        categories,
-        weights=[
-            max(0, float(weights.get(category, 0)))
-            for category in categories
-        ],
-        k=1,
-    )[0] if sum(
-        max(0, float(weights.get(c, 0)))
-        for c in categories
-    ) > 0 else random.choice(categories)
-
-    selected = random.choice(groups[selected_category])
-
-    print(
-        f"Selected {selected_category}: "
-        f"{selected['id']} by {selected['creator']}"
-    )
-
-    return selected
+    return random.choice(pool)
 
 
-def send_discord_alert(stream, image):
+def send_discord(stream, image):
     title = (
         stream.get("title") or "Come hang out!"
     )[:256].replace("@", "@\u200b")
@@ -187,33 +355,46 @@ def send_discord_alert(stream, image):
         "color": 9520895,
         "description": (
             f"🎮 **Now Playing:** {game}\n\n"
-            "Come hang out on Twitch!"
+            "Come hang out!"
         ),
         "footer": {
-            "text": "DidacticJam • Twitch Live"
+            "text": "DidacticJam • Twitch"
         },
     }
 
     if image:
-        embed["image"] = {
-            "url": image["image_url"]
-        }
+        embed["image"] = {"url": image["url"]}
 
-        creator = image["creator"].replace(
+        creator = str(image["creator"]).replace(
             "@", "@\u200b"
-        )[:200]
+        )[:180]
 
-        embed["fields"] = [
-            {
-                "name": "🎨 Artwork credit",
-                "value": (
-                    f"**{creator}** · "
-                    f"{image['category']}\n"
-                    f"[Original artwork]({image['source_url']})"
-                )[:1024],
-                "inline": False,
-            }
-        ]
+        if image["type"] == "fanart":
+            credit = (
+                f"By **{creator}**\n"
+                f"[Original artwork]({image['source_url']})"
+            )
+
+            if image.get("license"):
+                credit += (
+                    f"\nLicense: {image['license']}"
+                )
+
+                if safe_url(image.get("license_url")):
+                    credit += (
+                        f" · [Terms]({image['license_url']})"
+                    )
+        else:
+            credit = (
+                "Gameplay screenshot via IGDB\n"
+                f"[Game imagery]({image['source_url']})"
+            )
+
+        embed["fields"] = [{
+            "name": "🖼️ Image source",
+            "value": credit[:1024],
+            "inline": False,
+        }]
 
     payload = {
         "username": "DidacticJam Live",
@@ -225,19 +406,19 @@ def send_discord_alert(stream, image):
         "allowed_mentions": {"parse": []},
     }
 
-    data = json.dumps(payload).encode("utf-8")
-
-    request = urllib.request.Request(
+    req = urllib.request.Request(
         WEBHOOK_URL,
-        data=data,
-        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json"
+        },
         method="POST",
     )
 
-    with urllib.request.urlopen(request, timeout=30) as r:
-        if r.status not in (200, 204):
+    with urllib.request.urlopen(req, timeout=30) as response:
+        if response.status not in (200, 204):
             raise RuntimeError(
-                f"Discord HTTP error: {r.status}"
+                f"Discord HTTP {response.status}"
             )
 
 
@@ -249,12 +430,12 @@ def save_state(state):
 
 
 def main():
-    token = get_access_token()
-    stream = get_live_stream(token)
+    token = get_token()
+    stream = get_stream(token)
 
     current_id = stream["id"] if stream else None
 
-    # First run never announces an already-live stream.
+    # Preserve the existing one-alert-per-stream behavior.
     if not STATE_FILE.exists():
         save_state({
             "last_stream_id": current_id,
@@ -269,36 +450,47 @@ def main():
     state.setdefault("image_history", {})
 
     if not stream:
-        print("DidacticJam is currently offline.")
+        print("DidacticJam is offline.")
         return
 
     if current_id == state.get("last_stream_id"):
-        print("This stream has already been processed.")
+        print("Already announced this stream.")
         return
 
-    library = load_library()
-    game_id = str(stream.get("game_id", ""))
-    print(f"Twitch game: {stream.get('game_name')} | ID: {game_id}")
+    game_id = stream.get("game_id", "")
+    game_name = stream.get("game_name", "")
 
-    image = choose_image(game_id, library, state)
+    print(f"Game: {game_name} | Twitch ID: {game_id}")
 
-    # Send notification before recording success.
-    send_discord_alert(stream, image)
+    fanart = get_fanart(game_name)
+
+    igdb_id = get_igdb_id(game_id, token)
+    screenshots = get_screenshots(igdb_id, token)
+
+    image = choose_image(
+        game_id, fanart, screenshots, state
+    )
+
+    if image:
+        print(
+            f"Selected {image['type']}: {image['id']}"
+        )
+    else:
+        print("No suitable image. Posting text only.")
+
+    send_discord(stream, image)
 
     state["last_stream_id"] = current_id
 
     if image:
         history = state["image_history"].setdefault(
-            game_id, []
+            str(game_id), []
         )
         history.append(image["id"])
-
-        # Keep enough history to rotate through the pool.
-        state["image_history"][game_id] = history[-100:]
+        state["image_history"][str(game_id)] = history[-100:]
 
     save_state(state)
-
-    print("Discord live announcement posted!")
+    print("Live announcement posted!")
 
 
 if __name__ == "__main__":

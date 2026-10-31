@@ -1,30 +1,31 @@
 
 import json
 import os
-import urllib.error
 import random
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+# ============================================================
+# DIDACTICJAM - TWITCH TO DISCORD
+# Fan art + gameplay screenshots
+# ============================================================
 
 CHANNEL = "didacticjam"
 CHANNEL_URL = f"https://www.twitch.tv/{CHANNEL}"
 STATE_FILE = Path("twitch_state.json")
 
-CLIENT_ID = os.environ["TWITCH_CLIENT_ID"]
-CLIENT_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
-WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
+TWITCH_CLIENT_ID = os.environ["TWITCH_CLIENT_ID"]
+TWITCH_CLIENT_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
+DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 
-# Artwork selection weights.
 FANART_WEIGHT = 55
 SCREENSHOT_WEIGHT = 45
 
-# Automatic image matching is conservative.
-# Set to False only if you accept looser matches.
 STRICT_GAME_MATCHING = True
 
-# Never use wiki-hosted or wiki-sourced images.
 BLOCKED_DOMAINS = (
     "fandom.com",
     "wikia.com",
@@ -32,10 +33,12 @@ BLOCKED_DOMAINS = (
     "wikimedia.org",
 )
 
-# Require licenses that permit redistribution.
-# This does NOT independently verify copyright claims.
 ALLOWED_LICENSES = {"by", "by-sa", "cc0"}
 
+
+# ============================================================
+# HTTP REQUEST HELPERS
+# ============================================================
 
 def request_json(url, data=None, headers=None):
     req = urllib.request.Request(
@@ -43,6 +46,7 @@ def request_json(url, data=None, headers=None):
         data=data,
         headers={
             "User-Agent": "DidacticJamArtBot/1.0",
+            "Accept": "application/json",
             **(headers or {}),
         },
     )
@@ -51,50 +55,57 @@ def request_json(url, data=None, headers=None):
         return json.load(response)
 
 
-def get_token():
-    body = urllib.parse.urlencode({
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "client_credentials",
-    }).encode()
+# ============================================================
+# TWITCH AUTHENTICATION AND STREAM DETECTION
+# ============================================================
 
-    return request_json(
+def get_twitch_token():
+    body = urllib.parse.urlencode({
+        "client_id": TWITCH_CLIENT_ID,
+        "client_secret": TWITCH_CLIENT_SECRET,
+        "grant_type": "client_credentials",
+    }).encode("utf-8")
+
+    result = request_json(
         "https://id.twitch.tv/oauth2/token",
         data=body,
         headers={
-            "Content-Type": "application/x-www-form-urlencoded"
+            "Content-Type": "application/x-www-form-urlencoded",
         },
-    )["access_token"]
+    )
+
+    return result["access_token"]
 
 
 def twitch_headers(token):
     return {
-        "Client-Id": CLIENT_ID,
+        "Client-Id": TWITCH_CLIENT_ID,
         "Authorization": f"Bearer {token}",
     }
 
 
 def get_stream(token):
-    params = urllib.parse.urlencode({
-        "user_login": CHANNEL
+    query = urllib.parse.urlencode({
+        "user_login": CHANNEL,
     })
 
     result = request_json(
-        f"https://api.twitch.tv/helix/streams?{params}",
+        f"https://api.twitch.tv/helix/streams?{query}",
         headers=twitch_headers(token),
     )
 
-    data = result.get("data", [])
-    return data[0] if data else None
+    streams = result.get("data", [])
+    return streams[0] if streams else None
 
 
 def get_igdb_id(game_id, token):
     if not game_id:
         return None
 
-    params = urllib.parse.urlencode({"id": game_id})
+    query = urllib.parse.urlencode({"id": game_id})
+
     result = request_json(
-        f"https://api.twitch.tv/helix/games?{params}",
+        f"https://api.twitch.tv/helix/games?{query}",
         headers=twitch_headers(token),
     )
 
@@ -102,16 +113,21 @@ def get_igdb_id(game_id, token):
     return games[0].get("igdb_id") if games else None
 
 
+# ============================================================
+# IMAGE FILTERING
+# ============================================================
+
 def forbidden_url(url):
     try:
         hostname = (
             urllib.parse.urlsplit(url).hostname or ""
         ).lower()
-    except ValueError:
+    except (ValueError, TypeError):
         return True
 
     return any(
-        hostname == domain or hostname.endswith("." + domain)
+        hostname == domain
+        or hostname.endswith("." + domain)
         for domain in BLOCKED_DOMAINS
     )
 
@@ -126,16 +142,13 @@ def safe_url(url):
 
 def normalize(text):
     return re.sub(
-        r"[^a-z0-9]+", " ",
+        r"[^a-z0-9]+",
+        " ",
         str(text).lower(),
     ).strip()
 
 
 def matching_game(game_name, item):
-    """
-    Conservative text matching to reduce wrong-game results.
-    This is not visual verification.
-    """
     title = normalize(item.get("title", ""))
     game = normalize(game_name)
 
@@ -152,18 +165,45 @@ def matching_game(game_name, item):
     )
 
 
+# ============================================================
+# OPENVERSE AUTHENTICATION
+# ============================================================
+
+def get_openverse_token():
+    client_id = os.environ["OPENVERSE_CLIENT_ID"]
+    client_secret = os.environ["OPENVERSE_CLIENT_SECRET"]
+
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }).encode("utf-8")
+
+    result = request_json(
+        "https://api.openverse.org/v1/auth_tokens/token/",
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+
+    print("Openverse authentication successful")
+    return result["access_token"]
+
+
+# ============================================================
+# OPENVERSE FAN ART DISCOVERY
+# ============================================================
+
 def get_fanart(game_name):
-    """
-    Search openly licensed images.
-    Only use entries with known source, creator,
-    and license metadata.
-    """
+    if not game_name:
+        return []
 
     query = urllib.parse.urlencode({
         "q": f'"{game_name}" fan art',
         "mature": "false",
         "license": "by,by-sa,cc0",
-        "page_size": 50,
+        "page_size": 20,
         "filter_dead": "true",
     })
 
@@ -173,7 +213,16 @@ def get_fanart(game_name):
     )
 
     try:
-        result = request_json(url)
+        openverse_token = get_openverse_token()
+
+        result = request_json(
+            url,
+            headers={
+                "Authorization": f"Bearer {openverse_token}",
+                "Accept": "application/json",
+            },
+        )
+
         images = []
 
         for item in result.get("results", []):
@@ -181,12 +230,13 @@ def get_fanart(game_name):
             source_url = item.get(
                 "foreign_landing_url", ""
             )
+
             creator = item.get("creator")
             license_name = (
                 item.get("license") or ""
             ).lower()
 
-            if item.get("mature") is not False:
+            if item.get("mature") is True:
                 continue
 
             if license_name not in ALLOWED_LICENSES:
@@ -207,15 +257,17 @@ def get_fanart(game_name):
             width = item.get("width") or 0
             height = item.get("height") or 0
 
-            # Prefer horizontal images.
             if width < 600 or height < 300:
                 continue
 
             if width < height:
                 continue
 
+            if not item.get("id"):
+                continue
+
             images.append({
-                "id": "openverse-" + item["id"],
+                "id": "openverse-" + str(item["id"]),
                 "type": "fanart",
                 "url": image_url,
                 "source_url": source_url,
@@ -227,10 +279,20 @@ def get_fanart(game_name):
         print(f"Found {len(images)} fan-art candidates")
         return images
 
+    except urllib.error.HTTPError as error:
+        print(
+            f"Fan-art lookup failed: HTTP {error.code}"
+        )
+        return []
+
     except Exception as error:
         print(f"Fan-art lookup failed: {error}")
         return []
 
+
+# ============================================================
+# IGDB GAMEPLAY SCREENSHOTS
+# ============================================================
 
 def get_screenshots(igdb_id, token):
     if not igdb_id:
@@ -240,7 +302,7 @@ def get_screenshots(igdb_id, token):
         "fields image_id,width,height; "
         f"where game = {int(igdb_id)}; "
         "limit 100;"
-    ).encode()
+    ).encode("utf-8")
 
     try:
         screenshots = request_json(
@@ -259,10 +321,13 @@ def get_screenshots(igdb_id, token):
             width = shot.get("width") or 0
             height = shot.get("height") or 0
 
-            if not image_id or width <= height:
+            if not image_id:
                 continue
 
-            url = (
+            if width <= height:
+                continue
+
+            image_url = (
                 "https://images.igdb.com/igdb/"
                 f"image/upload/t_1080p/{image_id}.jpg"
             )
@@ -270,23 +335,26 @@ def get_screenshots(igdb_id, token):
             results.append({
                 "id": "igdb-" + str(image_id),
                 "type": "screenshot",
-                "url": url,
-                "source_url": (
-                    f"https://www.igdb.com/games/"
-                    f"{igdb_id}"
-                ),
-                "creator": "IGDB game screenshots",
+                "url": image_url,
+                "source_url": "https://www.igdb.com/",
+                "creator": "IGDB",
                 "license": None,
                 "license_url": None,
             })
 
-        print(f"Found {len(results)} gameplay screenshots")
+        print(
+            f"Found {len(results)} gameplay screenshots"
+        )
         return results
 
     except Exception as error:
         print(f"Screenshot lookup failed: {error}")
         return []
 
+
+# ============================================================
+# IMAGE ROTATION
+# ============================================================
 
 def choose_image(game_id, fanart, screenshots, state):
     history = state.setdefault(
@@ -298,15 +366,15 @@ def choose_image(game_id, fanart, screenshots, state):
     if not all_images:
         return None
 
-    # Prioritize never-used images.
+    # Use images not previously selected.
     available = [
         img for img in all_images
         if img["id"] not in history
     ]
 
     if not available:
-        # Start a new rotation, avoiding last image.
         last_id = history[-1] if history else None
+
         available = [
             img for img in all_images
             if img["id"] != last_id
@@ -316,6 +384,7 @@ def choose_image(game_id, fanart, screenshots, state):
         img for img in available
         if img["type"] == "fanart"
     ]
+
     screenshot_pool = [
         img for img in available
         if img["type"] == "screenshot"
@@ -330,6 +399,7 @@ def choose_image(game_id, fanart, screenshots, state):
             ],
             k=1,
         )[0]
+
         pool = (
             fan_pool
             if category == "fanart"
@@ -340,6 +410,10 @@ def choose_image(game_id, fanart, screenshots, state):
 
     return random.choice(pool)
 
+
+# ============================================================
+# DISCORD WEBHOOK
+# ============================================================
 
 def send_discord(stream, image):
     title = (
@@ -364,7 +438,9 @@ def send_discord(stream, image):
     }
 
     if image:
-        embed["image"] = {"url": image["url"]}
+        embed["image"] = {
+            "url": image["url"],
+        }
 
         creator = str(image["creator"]).replace(
             "@", "@\u200b"
@@ -388,7 +464,7 @@ def send_discord(stream, image):
         else:
             credit = (
                 "Gameplay screenshot via IGDB\n"
-                f"[Game imagery]({image['source_url']})"
+                "[Image source](https://www.igdb.com/)"
             )
 
         embed["fields"] = [{
@@ -407,9 +483,8 @@ def send_discord(stream, image):
         "allowed_mentions": {"parse": []},
     }
 
-   
     req = urllib.request.Request(
-        WEBHOOK_URL,
+        DISCORD_WEBHOOK_URL,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
@@ -419,22 +494,29 @@ def send_discord(stream, image):
         method="POST",
     )
 
-    
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            print(f"Discord webhook status: {response.status}")
+        with urllib.request.urlopen(
+            req, timeout=30
+        ) as response:
+            print(
+                f"Discord webhook status: {response.status}"
+            )
 
     except urllib.error.HTTPError as error:
         details = error.read().decode(
             "utf-8", errors="replace"
         )
 
-        print(f"Discord webhook failed: HTTP {error.code}")
+        print(
+            f"Discord webhook failed: HTTP {error.code}"
+        )
         print(f"Discord response: {details[:1000]}")
-
         raise
 
 
+# ============================================================
+# SAVE AND RESTORE HISTORY
+# ============================================================
 
 def save_state(state):
     STATE_FILE.write_text(
@@ -443,13 +525,17 @@ def save_state(state):
     )
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
-    token = get_token()
+    token = get_twitch_token()
     stream = get_stream(token)
 
     current_id = stream["id"] if stream else None
 
-    # Preserve the existing one-alert-per-stream behavior.
+    # First run: initialize without posting an old stream.
     if not STATE_FILE.exists():
         save_state({
             "last_stream_id": current_id,
@@ -461,6 +547,7 @@ def main():
     state = json.loads(
         STATE_FILE.read_text(encoding="utf-8")
     )
+
     state.setdefault("image_history", {})
 
     if not stream:
@@ -474,15 +561,26 @@ def main():
     game_id = stream.get("game_id", "")
     game_name = stream.get("game_name", "")
 
-    print(f"Game: {game_name} | Twitch ID: {game_id}")
+    print(
+        f"Game: {game_name} | Twitch ID: {game_id}"
+    )
 
+    # Find fan art.
     fanart = get_fanart(game_name)
 
+    # Find game-specific screenshots.
     igdb_id = get_igdb_id(game_id, token)
-    screenshots = get_screenshots(igdb_id, token)
 
+    screenshots = get_screenshots(
+        igdb_id, token
+    )
+
+    # Rotate images.
     image = choose_image(
-        game_id, fanart, screenshots, state
+        game_id,
+        fanart,
+        screenshots,
+        state,
     )
 
     if image:
@@ -490,8 +588,11 @@ def main():
             f"Selected {image['type']}: {image['id']}"
         )
     else:
-        print("No suitable image. Posting text only.")
+        print(
+            "No suitable image. Posting text only."
+        )
 
+    # Announce before saving stream state.
     send_discord(stream, image)
 
     state["last_stream_id"] = current_id
@@ -500,10 +601,15 @@ def main():
         history = state["image_history"].setdefault(
             str(game_id), []
         )
+
         history.append(image["id"])
-        state["image_history"][str(game_id)] = history[-100:]
+
+        state["image_history"][str(game_id)] = (
+            history[-100:]
+        )
 
     save_state(state)
+
     print("Live announcement posted!")
 
 

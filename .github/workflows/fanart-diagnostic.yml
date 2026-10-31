@@ -1,0 +1,179 @@
+
+name: Diagnose Fan Art Discovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Diagnose Openverse searches
+        env:
+          OPENVERSE_CLIENT_ID: ${{ secrets.OPENVERSE_CLIENT_ID }}
+          OPENVERSE_CLIENT_SECRET: ${{ secrets.OPENVERSE_CLIENT_SECRET }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+          from collections import Counter
+
+          BASE = "https://api.openverse.org/v1"
+
+          def get_json(url, data=None, token=None):
+              headers = {
+                  "User-Agent": "DidacticJamArtBot/1.0",
+                  "Accept": "application/json",
+              }
+
+              if data is not None:
+                  headers["Content-Type"] = (
+                      "application/x-www-form-urlencoded"
+                  )
+
+              if token:
+                  headers["Authorization"] = (
+                      "Bearer " + token
+                  )
+
+              req = urllib.request.Request(
+                  url, data=data, headers=headers
+              )
+
+              with urllib.request.urlopen(
+                  req, timeout=40
+              ) as response:
+                  return json.load(response)
+
+          credentials = urllib.parse.urlencode({
+              "client_id": os.environ["OPENVERSE_CLIENT_ID"],
+              "client_secret": os.environ["OPENVERSE_CLIENT_SECRET"],
+              "grant_type": "client_credentials",
+          }).encode()
+
+          auth = get_json(
+              BASE + "/auth_tokens/token/",
+              data=credentials,
+          )
+          token = auth["access_token"]
+
+          print("Authentication: SUCCESS", flush=True)
+
+          queries = [
+              "Resident Evil Code Veronica fan art",
+              "Code Veronica",
+              "Claire Redfield",
+              "Resident Evil fanart",
+          ]
+
+          for query in queries:
+              print("\n" + "=" * 50, flush=True)
+              print("SEARCH:", query, flush=True)
+
+              params = urllib.parse.urlencode({
+                  "q": query,
+                  "page_size": 30,
+                  "mature": "false",
+              })
+
+              try:
+                  data = get_json(
+                      BASE + "/images/?" + params,
+                      token=token,
+                  )
+              except Exception as error:
+                  print("Search error:", error, flush=True)
+                  continue
+
+              results = data.get("results", [])
+
+              print(
+                  "Total reported matches:",
+                  data.get("result_count", 0)
+              )
+              print("Results returned:", len(results))
+
+              licenses = Counter(
+                  str(x.get("license"))
+                  for x in results
+              )
+
+              print("License breakdown:", dict(licenses))
+
+              reasons = Counter()
+              survivors = []
+
+              for item in results:
+                  if item.get("mature") is not False:
+                      reasons["mature/unknown"] += 1
+                      continue
+
+                  if item.get("license") not in (
+                      "by", "by-sa", "cc0"
+                  ):
+                      reasons["license"] += 1
+                      continue
+
+                  if not item.get("creator"):
+                      reasons["missing creator"] += 1
+                      continue
+
+                  if not item.get("foreign_landing_url"):
+                      reasons["missing source"] += 1
+                      continue
+
+                  if not item.get("url"):
+                      reasons["missing image URL"] += 1
+                      continue
+
+                  width = item.get("width") or 0
+                  height = item.get("height") or 0
+
+                  if width < 600 or height < 300:
+                      reasons["dimensions"] += 1
+                      continue
+
+                  if width < height:
+                      reasons["portrait orientation"] += 1
+                      continue
+
+                  survivors.append(item)
+
+              print("Filter rejection reasons:", dict(reasons))
+              print(
+                  "Candidates before game-title matching:",
+                  len(survivors)
+              )
+
+              print("\nFIRST FIVE RESULT TITLES:")
+              for item in results[:5]:
+                  title = str(item.get("title") or "")
+                  print(
+                      "-",
+                      title.replace("\n", " ")[:120],
+                      "| License:",
+                      item.get("license"),
+                      "| Creator:",
+                      str(item.get("creator"))[:60],
+                  )
+
+              print("\nFIRST FIVE SURVIVORS:")
+              for item in survivors[:5]:
+                  print(
+                      "-",
+                      str(item.get("title") or "")[:120]
+                  )
+
+          print("\nDiagnostic complete")
+          PY

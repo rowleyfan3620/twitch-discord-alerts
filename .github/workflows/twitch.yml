@@ -28,11 +28,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check Twitch and notify Discord
+            - name: Check Twitch and notify Discord
         env:
           TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
           TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          OPENVERSE_CLIENT_ID: ${{ secrets.OPENVERSE_CLIENT_ID }}
+          OPENVERSE_CLIENT_SECRET: ${{ secrets.OPENVERSE_CLIENT_SECRET }}
         run: python twitch_to_discord.py
 
       - name: Save stream state

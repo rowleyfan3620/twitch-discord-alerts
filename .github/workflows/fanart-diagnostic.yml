@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Diagnose Openverse searches
+      - name: Diagnose Openverse
         env:
           OPENVERSE_CLIENT_ID: ${{ secrets.OPENVERSE_CLIENT_ID }}
           OPENVERSE_CLIENT_SECRET: ${{ secrets.OPENVERSE_CLIENT_SECRET }}
@@ -25,6 +25,8 @@ jobs:
           python - <<'PY'
           import json
           import os
+          import time
+          import urllib.error
           import urllib.parse
           import urllib.request
           from collections import Counter
@@ -38,52 +40,71 @@ jobs:
               }
 
               if data is not None:
-                  headers["Content-Type"] = (
-                      "application/x-www-form-urlencoded"
-                  )
+                  headers["Content-Type"] = "application/x-www-form-urlencoded"
 
               if token:
-                  headers["Authorization"] = (
-                      "Bearer " + token
-                  )
+                  headers["Authorization"] = "Bearer " + token
 
-              req = urllib.request.Request(
-                  url, data=data, headers=headers
-              )
+              for attempt in range(1, 4):
+                  try:
+                      req = urllib.request.Request(
+                          url, data=data, headers=headers
+                      )
+                      with urllib.request.urlopen(
+                          req, timeout=20
+                      ) as response:
+                          return json.load(response)
 
-              with urllib.request.urlopen(
-                  req, timeout=40
-              ) as response:
-                  return json.load(response)
+                  except urllib.error.HTTPError as error:
+                      print(
+                          f"HTTP {error.code}, attempt {attempt}/3",
+                          flush=True
+                      )
+                      if error.code not in (429, 500, 502, 503, 504):
+                          raise
 
-          credentials = urllib.parse.urlencode({
+                  except (TimeoutError, urllib.error.URLError) as error:
+                      print(
+                          f"Connection error, attempt {attempt}/3: {error}",
+                          flush=True
+                      )
+
+                  if attempt < 3:
+                      time.sleep(attempt * 3)
+
+              raise RuntimeError("Openverse unavailable after retries")
+
+          body = urllib.parse.urlencode({
               "client_id": os.environ["OPENVERSE_CLIENT_ID"],
               "client_secret": os.environ["OPENVERSE_CLIENT_SECRET"],
               "grant_type": "client_credentials",
           }).encode()
 
-          auth = get_json(
-              BASE + "/auth_tokens/token/",
-              data=credentials,
-          )
-          token = auth["access_token"]
+          try:
+              auth = get_json(
+                  BASE + "/auth_tokens/token/",
+                  data=body,
+              )
+              token = auth["access_token"]
+              print("Authentication: SUCCESS", flush=True)
+          except Exception as error:
+              print("Authentication failed:", error, flush=True)
+              print("Try running this workflow later.")
+              raise SystemExit(0)
 
-          print("Authentication: SUCCESS", flush=True)
-
-          queries = [
-              "Resident Evil Code Veronica fan art",
+          searches = [
+              "Resident Evil Code Veronica",
               "Code Veronica",
               "Claire Redfield",
               "Resident Evil fanart",
           ]
 
-          for query in queries:
-              print("\n" + "=" * 50, flush=True)
-              print("SEARCH:", query, flush=True)
+          for query in searches:
+              print("\nSEARCH:", query, flush=True)
 
               params = urllib.parse.urlencode({
                   "q": query,
-                  "page_size": 30,
+                  "page_size": 20,
                   "mature": "false",
               })
 
@@ -93,87 +114,52 @@ jobs:
                       token=token,
                   )
               except Exception as error:
-                  print("Search error:", error, flush=True)
+                  print("Search unavailable:", error, flush=True)
                   continue
 
               results = data.get("results", [])
 
-              print(
-                  "Total reported matches:",
-                  data.get("result_count", 0)
-              )
-              print("Results returned:", len(results))
+              print("Total results:", data.get("result_count"))
+              print("Returned:", len(results))
 
               licenses = Counter(
-                  str(x.get("license"))
-                  for x in results
+                  str(x.get("license")) for x in results
               )
-
-              print("License breakdown:", dict(licenses))
+              print("Licenses:", dict(licenses))
 
               reasons = Counter()
               survivors = []
 
               for item in results:
                   if item.get("mature") is not False:
-                      reasons["mature/unknown"] += 1
-                      continue
+                      reasons["Mature/unknown"] += 1
+                  elif item.get("license") not in ("by", "by-sa", "cc0"):
+                      reasons["License"] += 1
+                  elif not item.get("creator"):
+                      reasons["No creator"] += 1
+                  elif not item.get("foreign_landing_url"):
+                      reasons["No source URL"] += 1
+                  elif not item.get("url"):
+                      reasons["No image URL"] += 1
+                  elif (item.get("width") or 0) < 600:
+                      reasons["Width"] += 1
+                  elif (item.get("height") or 0) < 300:
+                      reasons["Height"] += 1
+                  elif (item.get("width") or 0) < (item.get("height") or 0):
+                      reasons["Portrait"] += 1
+                  else:
+                      survivors.append(item)
 
-                  if item.get("license") not in (
-                      "by", "by-sa", "cc0"
-                  ):
-                      reasons["license"] += 1
-                      continue
+              print("Rejected:", dict(reasons))
+              print("Survivors before game matching:", len(survivors))
 
-                  if not item.get("creator"):
-                      reasons["missing creator"] += 1
-                      continue
-
-                  if not item.get("foreign_landing_url"):
-                      reasons["missing source"] += 1
-                      continue
-
-                  if not item.get("url"):
-                      reasons["missing image URL"] += 1
-                      continue
-
-                  width = item.get("width") or 0
-                  height = item.get("height") or 0
-
-                  if width < 600 or height < 300:
-                      reasons["dimensions"] += 1
-                      continue
-
-                  if width < height:
-                      reasons["portrait orientation"] += 1
-                      continue
-
-                  survivors.append(item)
-
-              print("Filter rejection reasons:", dict(reasons))
-              print(
-                  "Candidates before game-title matching:",
-                  len(survivors)
-              )
-
-              print("\nFIRST FIVE RESULT TITLES:")
               for item in results[:5]:
-                  title = str(item.get("title") or "")
                   print(
-                      "-",
-                      title.replace("\n", " ")[:120],
-                      "| License:",
-                      item.get("license"),
-                      "| Creator:",
-                      str(item.get("creator"))[:60],
+                      "Sample:",
+                      str(item.get("title") or "")[:100],
+                      "| License:", item.get("license"),
+                      "| Creator:", str(item.get("creator"))[:60],
                   )
 
-              print("\nFIRST FIVE SURVIVORS:")
-              for item in survivors[:5]:
-                  print(
-                      "-",
-                      str(item.get("title") or "")[:120]
-                  )
-
-          print("\nDiagnostic complete")
+          print("\nDiagnostic finished", flush=True)
           PY

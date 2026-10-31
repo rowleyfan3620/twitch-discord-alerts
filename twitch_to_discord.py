@@ -3,6 +3,8 @@ import json
 import os
 import random
 import re
+import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -10,7 +12,7 @@ from pathlib import Path
 
 # ============================================================
 # DIDACTICJAM - TWITCH TO DISCORD
-# Fan art + gameplay screenshots
+# Automatically finds fan art and gameplay screenshots
 # ============================================================
 
 CHANNEL = "didacticjam"
@@ -21,11 +23,19 @@ TWITCH_CLIENT_ID = os.environ["TWITCH_CLIENT_ID"]
 TWITCH_CLIENT_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 
+# Target artwork mix when both categories are available.
 FANART_WEIGHT = 55
 SCREENSHOT_WEIGHT = 45
 
+# Openverse reliability settings.
+OPENVERSE_TIMEOUT = 12
+OPENVERSE_ATTEMPTS = 3
+OPENVERSE_TOTAL_BUDGET = 45
+
+# Strict game-name matching reduces unrelated results.
 STRICT_GAME_MATCHING = True
 
+# No wiki-sourced images.
 BLOCKED_DOMAINS = (
     "fandom.com",
     "wikia.com",
@@ -33,14 +43,15 @@ BLOCKED_DOMAINS = (
     "wikimedia.org",
 )
 
+# Openly licensed images only.
 ALLOWED_LICENSES = {"by", "by-sa", "cc0"}
 
 
 # ============================================================
-# HTTP REQUEST HELPERS
+# REQUEST HELPERS
 # ============================================================
 
-def request_json(url, data=None, headers=None):
+def request_json(url, data=None, headers=None, timeout=30):
     req = urllib.request.Request(
         url,
         data=data,
@@ -51,12 +62,82 @@ def request_json(url, data=None, headers=None):
         },
     )
 
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.load(response)
 
 
+def retry_openverse_request(url, data=None, headers=None,
+                           deadline=None, label="Openverse"):
+    """
+    Retry transient Openverse errors while respecting a
+    total time budget, so live alerts aren't delayed forever.
+    """
+
+    for attempt in range(1, OPENVERSE_ATTEMPTS + 1):
+        remaining = (
+            deadline - time.monotonic()
+            if deadline is not None
+            else OPENVERSE_TIMEOUT
+        )
+
+        if remaining <= 0:
+            raise TimeoutError("Openverse time budget exceeded")
+
+        timeout = min(OPENVERSE_TIMEOUT, remaining)
+
+        try:
+            print(
+                f"{label}: attempt "
+                f"{attempt}/{OPENVERSE_ATTEMPTS}",
+                flush=True,
+            )
+
+            return request_json(
+                url,
+                data=data,
+                headers=headers,
+                timeout=timeout,
+            )
+
+        except urllib.error.HTTPError as error:
+            # Retry only transient API failures.
+            if error.code not in (429, 500, 502, 503, 504):
+                raise
+
+            print(
+                f"{label}: HTTP {error.code}",
+                flush=True,
+            )
+
+        except (
+            TimeoutError,
+            socket.timeout,
+            urllib.error.URLError,
+        ) as error:
+            print(
+                f"{label}: {error}",
+                flush=True,
+            )
+
+        if attempt == OPENVERSE_ATTEMPTS:
+            break
+
+        delay = attempt * 2
+
+        if deadline is not None:
+            delay = min(
+                delay,
+                max(0, deadline - time.monotonic()),
+            )
+
+        if delay > 0:
+            time.sleep(delay)
+
+    raise TimeoutError(f"{label} failed after retries")
+
+
 # ============================================================
-# TWITCH AUTHENTICATION AND STREAM DETECTION
+# TWITCH AUTHENTICATION
 # ============================================================
 
 def get_twitch_token():
@@ -84,6 +165,10 @@ def twitch_headers(token):
     }
 
 
+# ============================================================
+# TWITCH STREAM AND GAME DETECTION
+# ============================================================
+
 def get_stream(token):
     query = urllib.parse.urlencode({
         "user_login": CHANNEL,
@@ -102,7 +187,9 @@ def get_igdb_id(game_id, token):
     if not game_id:
         return None
 
-    query = urllib.parse.urlencode({"id": game_id})
+    query = urllib.parse.urlencode({
+        "id": game_id,
+    })
 
     result = request_json(
         f"https://api.twitch.tv/helix/games?{query}",
@@ -110,11 +197,12 @@ def get_igdb_id(game_id, token):
     )
 
     games = result.get("data", [])
+
     return games[0].get("igdb_id") if games else None
 
 
 # ============================================================
-# IMAGE FILTERING
+# IMAGE SAFETY AND MATCHING
 # ============================================================
 
 def forbidden_url(url):
@@ -133,11 +221,20 @@ def forbidden_url(url):
 
 
 def safe_url(url):
-    return (
-        isinstance(url, str)
-        and url.startswith("https://")
-        and not forbidden_url(url)
-    )
+    if not isinstance(url, str):
+        return False
+
+    try:
+        parsed = urllib.parse.urlsplit(url)
+
+        return (
+            parsed.scheme == "https"
+            and bool(parsed.hostname)
+            and not forbidden_url(url)
+        )
+
+    except ValueError:
+        return False
 
 
 def normalize(text):
@@ -158,8 +255,10 @@ def matching_game(game_name, item):
     if STRICT_GAME_MATCHING:
         return game in title
 
+    title_words = title.split()
+
     return all(
-        word in title.split()
+        word in title_words
         for word in game.split()
         if len(word) > 2
     )
@@ -169,7 +268,7 @@ def matching_game(game_name, item):
 # OPENVERSE AUTHENTICATION
 # ============================================================
 
-def get_openverse_token():
+def get_openverse_token(deadline):
     client_id = os.environ["OPENVERSE_CLIENT_ID"]
     client_secret = os.environ["OPENVERSE_CLIENT_SECRET"]
 
@@ -179,25 +278,36 @@ def get_openverse_token():
         "client_secret": client_secret,
     }).encode("utf-8")
 
-    result = request_json(
+    result = retry_openverse_request(
         "https://api.openverse.org/v1/auth_tokens/token/",
         data=body,
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
         },
+        deadline=deadline,
+        label="Openverse authentication",
     )
 
-    print("Openverse authentication successful")
+    print(
+        "Openverse authentication successful",
+        flush=True,
+    )
+
     return result["access_token"]
 
 
 # ============================================================
-# OPENVERSE FAN ART DISCOVERY
+# FAN ART DISCOVERY
 # ============================================================
 
 def get_fanart(game_name):
     if not game_name:
         return []
+
+    # Bound the entire authentication + search operation.
+    deadline = (
+        time.monotonic() + OPENVERSE_TOTAL_BUDGET
+    )
 
     query = urllib.parse.urlencode({
         "q": f'"{game_name}" fan art',
@@ -213,14 +323,16 @@ def get_fanart(game_name):
     )
 
     try:
-        openverse_token = get_openverse_token()
+        openverse_token = get_openverse_token(deadline)
 
-        result = request_json(
+        result = retry_openverse_request(
             url,
             headers={
                 "Authorization": f"Bearer {openverse_token}",
                 "Accept": "application/json",
             },
+            deadline=deadline,
+            label="Openverse image search",
         )
 
         images = []
@@ -232,11 +344,13 @@ def get_fanart(game_name):
             )
 
             creator = item.get("creator")
+
             license_name = (
                 item.get("license") or ""
             ).lower()
 
-            if item.get("mature") is True:
+            # Exclude items explicitly flagged as mature.
+            if item.get("mature") is not False:
                 continue
 
             if license_name not in ALLOWED_LICENSES:
@@ -257,6 +371,7 @@ def get_fanart(game_name):
             width = item.get("width") or 0
             height = item.get("height") or 0
 
+            # Discord embeds work best with landscape art.
             if width < 600 or height < 300:
                 continue
 
@@ -271,22 +386,30 @@ def get_fanart(game_name):
                 "type": "fanart",
                 "url": image_url,
                 "source_url": source_url,
-                "creator": creator,
+                "creator": str(creator),
                 "license": license_name.upper(),
                 "license_url": item.get("license_url"),
             })
 
-        print(f"Found {len(images)} fan-art candidates")
+        print(
+            f"Found {len(images)} fan-art candidates",
+            flush=True,
+        )
+
         return images
 
     except urllib.error.HTTPError as error:
         print(
-            f"Fan-art lookup failed: HTTP {error.code}"
+            f"Fan-art lookup failed: HTTP {error.code}",
+            flush=True,
         )
         return []
 
     except Exception as error:
-        print(f"Fan-art lookup failed: {error}")
+        print(
+            f"Fan-art lookup failed: {error}",
+            flush=True,
+        )
         return []
 
 
@@ -343,12 +466,17 @@ def get_screenshots(igdb_id, token):
             })
 
         print(
-            f"Found {len(results)} gameplay screenshots"
+            f"Found {len(results)} gameplay screenshots",
+            flush=True,
         )
+
         return results
 
     except Exception as error:
-        print(f"Screenshot lookup failed: {error}")
+        print(
+            f"Screenshot lookup failed: {error}",
+            flush=True,
+        )
         return []
 
 
@@ -366,7 +494,7 @@ def choose_image(game_id, fanart, screenshots, state):
     if not all_images:
         return None
 
-    # Use images not previously selected.
+    # Avoid already-used images until the pool is exhausted.
     available = [
         img for img in all_images
         if img["id"] not in history
@@ -405,6 +533,7 @@ def choose_image(game_id, fanart, screenshots, state):
             if category == "fanart"
             else screenshot_pool
         )
+
     else:
         pool = fan_pool or screenshot_pool
 
@@ -499,23 +628,31 @@ def send_discord(stream, image):
             req, timeout=30
         ) as response:
             print(
-                f"Discord webhook status: {response.status}"
+                f"Discord webhook status: {response.status}",
+                flush=True,
             )
 
     except urllib.error.HTTPError as error:
         details = error.read().decode(
-            "utf-8", errors="replace"
+            "utf-8",
+            errors="replace",
         )
 
         print(
-            f"Discord webhook failed: HTTP {error.code}"
+            f"Discord webhook failed: HTTP {error.code}",
+            flush=True,
         )
-        print(f"Discord response: {details[:1000]}")
+
+        print(
+            f"Discord response: {details[:1000]}",
+            flush=True,
+        )
+
         raise
 
 
 # ============================================================
-# SAVE AND RESTORE HISTORY
+# PERSISTENT STREAM + IMAGE HISTORY
 # ============================================================
 
 def save_state(state):
@@ -535,12 +672,13 @@ def main():
 
     current_id = stream["id"] if stream else None
 
-    # First run: initialize without posting an old stream.
+    # Don't post an already-live stream on first setup.
     if not STATE_FILE.exists():
         save_state({
             "last_stream_id": current_id,
             "image_history": {},
         })
+
         print("Initialized. Existing stream skipped.")
         return
 
@@ -562,20 +700,21 @@ def main():
     game_name = stream.get("game_name", "")
 
     print(
-        f"Game: {game_name} | Twitch ID: {game_id}"
+        f"Game: {game_name} | Twitch ID: {game_id}",
+        flush=True,
     )
 
-    # Find fan art.
+    # Fan-art search; failure doesn't stop the alert.
     fanart = get_fanart(game_name)
 
-    # Find game-specific screenshots.
-    igdb_id = get_igdb_id(game_id, token)
+    # Known-working IGDB screenshot fallback.
+    try:
+        igdb_id = get_igdb_id(game_id, token)
+        screenshots = get_screenshots(igdb_id, token)
+    except Exception as error:
+        print(f"IGDB lookup failed: {error}")
+        screenshots = []
 
-    screenshots = get_screenshots(
-        igdb_id, token
-    )
-
-    # Rotate images.
     image = choose_image(
         game_id,
         fanart,
@@ -585,14 +724,13 @@ def main():
 
     if image:
         print(
-            f"Selected {image['type']}: {image['id']}"
+            f"Selected {image['type']}: {image['id']}",
+            flush=True,
         )
     else:
-        print(
-            "No suitable image. Posting text only."
-        )
+        print("No suitable image. Posting text only.")
 
-    # Announce before saving stream state.
+    # Post before marking the stream as announced.
     send_discord(stream, image)
 
     state["last_stream_id"] = current_id
@@ -610,7 +748,10 @@ def main():
 
     save_state(state)
 
-    print("Live announcement posted!")
+    print(
+        "Live announcement posted!",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

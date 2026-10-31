@@ -416,17 +416,21 @@ def send_discord(stream, image):
         method="POST",
     )
 
+    
     try:
-    with urllib.request.urlopen(req, timeout=30) as response:
-        print(f"Discord webhook status: {response.status}")
+        with urllib.request.urlopen(req, timeout=30) as response:
+            print(f"Discord webhook status: {response.status}")
 
-except urllib.error.HTTPError as error:
-    details = error.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as error:
+        details = error.read().decode(
+            "utf-8", errors="replace"
+        )
 
-    print(f"Discord webhook failed: HTTP {error.code}")
-    print(f"Discord response: {details[:1000]}")
+        print(f"Discord webhook failed: HTTP {error.code}")
+        print(f"Discord response: {details[:1000]}")
 
-    raise
+        raise
+
 
 
 def save_state(state):

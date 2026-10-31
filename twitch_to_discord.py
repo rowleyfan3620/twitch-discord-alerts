@@ -1,6 +1,7 @@
 
 import json
 import os
+import urllib.error
 import random
 import re
 import urllib.parse
@@ -415,11 +416,17 @@ def send_discord(stream, image):
         method="POST",
     )
 
+    try:
     with urllib.request.urlopen(req, timeout=30) as response:
-        if response.status not in (200, 204):
-            raise RuntimeError(
-                f"Discord HTTP {response.status}"
-            )
+        print(f"Discord webhook status: {response.status}")
+
+except urllib.error.HTTPError as error:
+    details = error.read().decode("utf-8", errors="replace")
+
+    print(f"Discord webhook failed: HTTP {error.code}")
+    print(f"Discord response: {details[:1000]}")
+
+    raise
 
 
 def save_state(state):

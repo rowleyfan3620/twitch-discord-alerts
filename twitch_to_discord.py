@@ -407,11 +407,14 @@ def send_discord(stream, image):
         "allowed_mentions": {"parse": []},
     }
 
+   
     req = urllib.request.Request(
         WEBHOOK_URL,
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "User-Agent": "DidacticJam-LiveAlerts/1.0",
+            "Accept": "application/json",
         },
         method="POST",
     )
